@@ -69,70 +69,76 @@ static __le32 ceph_flags_sys2wire(u32 flags)
  * need to wait for MDS acknowledgement.
  */
 
-/*
- * Calculate the length sum of direct io vectors that can
- * be combined into one page vector.
- */
-static size_t dio_get_pagev_size(const struct iov_iter *it)
+static ssize_t __iter_get_bvecs(struct iov_iter *i, struct bio_vec *bvecs)
 {
-    const struct iovec *iov = it->iov;
-    const struct iovec *iovend = iov + it->nr_segs;
-    size_t size;
+	size_t total = 0;
+	int bvec_idx = 0;
 
-    size = iov->iov_len - it->iov_offset;
-    /*
-     * An iov can be page vectored when both the current tail
-     * and the next base are page aligned.
-     */
-    while (PAGE_ALIGNED((iov->iov_base + iov->iov_len)) &&
-           (++iov < iovend && PAGE_ALIGNED((iov->iov_base)))) {
-        size += iov->iov_len;
-    }
-    dout("dio_get_pagevlen len = %zu\n", size);
-    return size;
-}
-
-/*
- * Allocate a page vector based on (@it, @nbytes).
- * The return value is the tuple describing a page vector,
- * that is (@pages, @page_align, @num_pages).
- */
-static struct page **
-dio_get_pages_alloc(const struct iov_iter *it, size_t nbytes,
-		    size_t *page_align, int *num_pages)
-{
-	struct iov_iter tmp_it = *it;
-	size_t align;
-	struct page **pages;
-	int ret = 0, idx, npages;
-
-	align = (unsigned long)(it->iov->iov_base + it->iov_offset) &
-		(PAGE_SIZE - 1);
-	npages = calc_pages_for(align, nbytes);
-	pages = kvmalloc(sizeof(*pages) * npages, GFP_KERNEL);
-	if (!pages)
-		return ERR_PTR(-ENOMEM);
-
-	for (idx = 0; idx < npages; ) {
+	while (iov_iter_count(i)) {
+		struct page *pages[16];
+		ssize_t bytes;
 		size_t start;
-		ret = iov_iter_get_pages(&tmp_it, pages + idx, nbytes,
-					 npages - idx, &start);
-		if (ret < 0)
-			goto fail;
+		int idx = 0;
 
-		iov_iter_advance(&tmp_it, ret);
-		nbytes -= ret;
-		idx += (ret + start + PAGE_SIZE - 1) / PAGE_SIZE;
+		bytes = iov_iter_get_pages(i, pages, SIZE_MAX, 16, &start);
+		if (bytes < 0)
+			return total ?: bytes;
+
+		for ( ; bytes; idx++, bvec_idx++) {
+			struct bio_vec bv = {
+				.bv_page = pages[idx],
+				.bv_len = min_t(int, bytes, PAGE_SIZE - start),
+				.bv_offset = start,
+			};
+
+			bvecs[bvec_idx] = bv;
+			iov_iter_advance(i, bv.bv_len);
+			total += bv.bv_len;
+			bytes -= bv.bv_len;
+			start = 0;
+		}
 	}
 
-	BUG_ON(nbytes != 0);
-	*num_pages = npages;
-	*page_align = align;
-	dout("dio_get_pages_alloc: got %d pages align %zu\n", npages, align);
-	return pages;
-fail:
-	ceph_put_page_vector(pages, idx, false);
-	return ERR_PTR(ret);
+	return total;
+}
+
+static ssize_t iter_get_bvecs_alloc(struct iov_iter *i, size_t maxsize,
+				    struct bio_vec **bvecs, int *num_bvecs)
+{
+	struct iov_iter ii = *i;
+	struct bio_vec *bv;
+	ssize_t bytes;
+	int npages;
+
+	iov_iter_truncate(&ii, maxsize);
+	npages = iov_iter_npages(&ii, INT_MAX);
+	bv = kcalloc(npages, sizeof(*bv), GFP_KERNEL);
+	if (!bv)
+		return -ENOMEM;
+
+	bytes = __iter_get_bvecs(&ii, bv);
+	if (bytes < 0) {
+		kfree(bv);
+		return bytes;
+	}
+
+	*bvecs = bv;
+	*num_bvecs = npages;
+	return bytes;
+}
+
+static void put_bvecs(struct bio_vec *bvecs, int num_bvecs, bool should_dirty)
+{
+	int i;
+
+	for (i = 0; i < num_bvecs; i++) {
+		if (bvecs[i].bv_page) {
+			if (should_dirty)
+				set_page_dirty_lock(bvecs[i].bv_page);
+			put_page(bvecs[i].bv_page);
+		}
+	}
+	kfree(bvecs);
 }
 
 /*
@@ -744,11 +750,12 @@ static void ceph_aio_complete_req(struct ceph_osd_request *req)
 	struct inode *inode = req->r_inode;
 	struct ceph_aio_request *aio_req = req->r_priv;
 	struct ceph_osd_data *osd_data = osd_req_op_extent_osd_data(req, 0);
-	int num_pages = calc_pages_for((u64)osd_data->alignment,
-				       osd_data->length);
 
-	dout("ceph_aio_complete_req %p rc %d bytes %llu\n",
-	     inode, rc, osd_data->length);
+	BUG_ON(osd_data->type != CEPH_OSD_DATA_TYPE_BVECS);
+	BUG_ON(!osd_data->num_bvecs);
+
+	dout("ceph_aio_complete_req %p rc %d bytes %u\n",
+	     inode, rc, osd_data->bvec_pos.iter.bi_size);
 
 	if (rc == -EOLDSNAPC) {
 		struct ceph_aio_work *aio_work;
@@ -766,9 +773,10 @@ static void ceph_aio_complete_req(struct ceph_osd_request *req)
 	} else if (!aio_req->write) {
 		if (rc == -ENOENT)
 			rc = 0;
-		if (rc >= 0 && osd_data->length > rc) {
-			int zoff = osd_data->alignment + rc;
-			int zlen = osd_data->length - rc;
+		if (rc >= 0 && osd_data->bvec_pos.iter.bi_size > rc) {
+			struct iov_iter i;
+			int zlen = osd_data->bvec_pos.iter.bi_size - rc;
+
 			/*
 			 * If read is satisfied by single OSD request,
 			 * it can pass EOF. Otherwise read is within
@@ -783,13 +791,16 @@ static void ceph_aio_complete_req(struct ceph_osd_request *req)
 				aio_req->total_len = rc + zlen;
 			}
 
-			if (zlen > 0)
-				ceph_zero_page_vector_range(zoff, zlen,
-							    osd_data->pages);
+			iov_iter_bvec(&i, ITER_BVEC, osd_data->bvec_pos.bvecs,
+				      osd_data->num_bvecs,
+				      osd_data->bvec_pos.iter.bi_size);
+			iov_iter_advance(&i, rc);
+			iov_iter_zero(zlen, &i);
 		}
 	}
 
-	ceph_put_page_vector(osd_data->pages, num_pages, aio_req->should_dirty);
+	put_bvecs(osd_data->bvec_pos.bvecs, osd_data->num_bvecs,
+		  aio_req->should_dirty);
 	ceph_osdc_put_request(req);
 
 	if (rc < 0)
@@ -877,7 +888,7 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 	struct ceph_fs_client *fsc = ceph_inode_to_client(inode);
 	struct ceph_vino vino;
 	struct ceph_osd_request *req;
-	struct page **pages;
+	struct bio_vec *bvecs;
 	struct ceph_aio_request *aio_req = NULL;
 	int num_pages = 0;
 	int flags;
@@ -912,8 +923,7 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 	}
 
 	while (iov_iter_count(iter) > 0) {
-		u64 size = dio_get_pagev_size(iter);
-		size_t start = 0;
+		u64 size = iov_iter_count(iter);
 		ssize_t len;
 
 		vino = ceph_vino(inode);
@@ -936,11 +946,10 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 		else
 			size = min_t(u64, size, fsc->mount_options->rsize);
 
-		len = size;
-		pages = dio_get_pages_alloc(iter, len, &start, &num_pages);
-		if (IS_ERR(pages)) {
+		len = iter_get_bvecs_alloc(iter, size, &bvecs, &num_pages);
+		if (len < 0) {
 			ceph_osdc_put_request(req);
-			ret = PTR_ERR(pages);
+			ret = len;
 			break;
 		}
 
@@ -975,8 +984,7 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 			req->r_mtime = mtime;
 		}
 
-		osd_req_op_extent_osd_data_pages(req, 0, pages, len, start,
-						 false, false);
+		osd_req_op_extent_osd_data_bvecs(req, 0, bvecs, num_pages, len);
 
 		if (aio_req) {
 			aio_req->total_len += len;
@@ -1002,18 +1010,21 @@ ceph_direct_read_write(struct kiocb *iocb, struct iov_iter *iter,
 			if (ret == -ENOENT)
 				ret = 0;
 			if (ret >= 0 && ret < len && pos + ret < size) {
+				struct iov_iter i;
 				int zlen = min_t(size_t, len - ret,
 						 size - pos - ret);
-				ceph_zero_page_vector_range(start + ret, zlen,
-							    pages);
+
+				iov_iter_bvec(&i, ITER_BVEC, bvecs, num_pages,
+					      len);
+				iov_iter_advance(&i, ret);
+				iov_iter_zero(zlen, &i);
 				ret += zlen;
 			}
 			if (ret >= 0)
 				len = ret;
 		}
 
-		ceph_put_page_vector(pages, num_pages, should_dirty);
-
+		put_bvecs(bvecs, num_pages, should_dirty);
 		ceph_osdc_put_request(req);
 		if (ret < 0)
 			break;
